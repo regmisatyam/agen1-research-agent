@@ -20,8 +20,10 @@ class Journal:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.verbose, self.quiet = verbose, quiet
         self.recent = deque(maxlen=100)
+        # Very short values are placeholders such as "none"; replacing every
+        # occurrence of one would corrupt evidence text and the JSON logs.
         self.secrets = [v for k, v in os.environ.items()
-                        if any(x in k.upper() for x in ("API_KEY", "TOKEN", "SECRET", "PASSWORD")) and len(v) >= 4]
+                        if any(x in k.upper() for x in ("API_KEY", "TOKEN", "SECRET", "PASSWORD")) and len(v) >= 8]
         self.path = self.directory / "events.jsonl"
         self.activity = self.directory / "activity.md"
         if not self.activity.exists():
@@ -77,11 +79,17 @@ class Store:
             "id": sid, "title": title, "url": url, "text": text[:16000], "provider": provider, **metadata})))
         old = self.state["sources"].get(sid)
         ranks = {"search_snippet": 0, "abstract": 1, "page_text": 2, "pdf_excerpt": 3}
-        if old and ranks.get(old.get("evidence_type"), 0) > ranks.get(incoming.get("evidence_type"), 0):
+        old_rank = ranks.get(old.get("evidence_type"), 0) if old else -1
+        new_rank = ranks.get(incoming.get("evidence_type"), 0)
+        if old_rank > new_rank:
             incoming["text"], incoming["evidence_type"] = old["text"], old["evidence_type"]
+        # Fetched pages are titled by URL; keep the real title from the search result.
+        if old and title == url:
+            incoming["title"] = old["title"]
         self.state["sources"][sid] = incoming
         self.save()
-        return sid, is_new
+        # Stronger evidence for a known source is progress, just like a new source.
+        return sid, is_new or new_rank > old_rank
 
     def note(self, text, citations, agent):
         unknown = set(citations) - self.state["sources"].keys()
@@ -96,7 +104,15 @@ class Store:
         self.save()
         return True
 
-    def evidence(self, limit=24000):
+    def mark_read(self, source_id):
+        """Record that the model read a source, even if it found nothing relevant.
+
+        Verbatim excerpts only stand in for that reading, so they are removed."""
+        self.state["notes"] = [n for n in self.state["notes"] if not (n.get("agent") == "direct-excerpt" and source_id in n["citations"])]
+        self.state.setdefault("read_sources", []).append(source_id)
+        self.save()
+
+    def evidence(self, limit=24000, max_notes=20):
         """Bounded context with space reserved for supplied proposal/reference excerpts."""
         all_sources = list(self.state["sources"].values())
         materials = sorted((s for s in all_sources if s.get("provider") == "user"),
@@ -109,7 +125,8 @@ class Store:
             if len(json.dumps(compact + [item])) > budget:
                 break
             compact.append(item)
-        result = {"notes": self.state["notes"][-20:], "materials": compact,
+        notes = self.state["notes"] if max_notes is None else self.state["notes"][-max_notes:]
+        result = {"notes": notes, "materials": compact,
                   "materials_total": len(materials), "materials_omitted": len(materials) - len(compact),
                   "sources": [{k: v for k, v in s.items() if k != "text"} | {"text": s["text"][:1200]}
                               for s in all_sources if s.get("provider") != "user"]}

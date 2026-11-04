@@ -20,6 +20,8 @@ class Config:
     context_chars: int = 40_000
     supervisor_interval: float = 5
     stall_seconds: float = 180
+    max_restarts: int = 5
+    no_reasoning: bool = False
     allow_shell: bool = False
     full_access: bool = False
     verbose: bool = False
@@ -37,6 +39,8 @@ class Config:
         for name in ("workers", "llm_concurrency", "max_steps", "max_tokens", "max_output_tokens"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
+        if self.max_restarts < 0:
+            raise ValueError("max_restarts must not be negative")
         if self.context_chars < 8000:
             raise ValueError("context_chars must be at least 8000")
         if self.workers > 16:

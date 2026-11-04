@@ -38,6 +38,8 @@ def parser():
     run.add_argument('--max-output-tokens', type=int, default=2048)
     run.add_argument('--context-chars', type=int, default=40000)
     run.add_argument('--stall-seconds', type=float, default=180)
+    run.add_argument('--max-restarts', type=int, default=5, help='Recovery rounds, each using a different method, after workers fail or no findings are recorded')
+    run.add_argument('--no-reasoning', action='store_true', help='Ask the server to skip model reasoning from the start (chat_template_kwargs enable_thinking=false)')
     run.add_argument('--allow-shell', action='store_true', help='Allow autonomous shell commands with your OS permissions (not sandboxed)')
     run.add_argument('--full-access', action='store_true', help='Also allow file tools outside the run workspace; requires --allow-shell')
     run.add_argument('--verbose', action='store_true', help='Display full conversations and tool results in terminal')

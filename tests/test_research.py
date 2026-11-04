@@ -20,8 +20,9 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
+        # These tests pin single-round behavior; test_recovery.py covers restarts.
         self.config = Config('Evidence synthesis', self.directory, hours=.01, demo=True,
-                             supervisor_interval=.02, request_timeout=1)
+                             supervisor_interval=.02, request_timeout=1, max_restarts=0)
         self.journal = Journal(self.directory, quiet=True)
         self.store = Store(self.directory, self.config.topic, self.journal)
         self.http = DemoHTTP()

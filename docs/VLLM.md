@@ -133,12 +133,13 @@ To authorize autonomous Bash commands with your OS user's permissions, add `--al
 | HTTP 401/403 from vLLM | Set `LOCAL_LLM_API_KEY` if the server requires it, and check access configuration. |
 | Chat-template error | Use an instruct/chat model with a working chat template configured in vLLM. Agen1 calls `/v1/chat/completions`. |
 | Invalid JSON decisions | Use a model that follows JSON instructions. The client consumes ordinary assistant `content` containing one JSON action; it does not consume native `tool_calls` or `reasoning_content`. Configure thinking/reasoning behavior appropriately for your model. |
+| `Model returned empty/non-text content` | A reasoning model probably used its whole output budget: check `reasoning_chars` and `finish_reason` in the `llm_retry` events. Agen1 retries with reasoning disabled through `chat_template_kwargs`, and also does so after a timeout. Pass `--no-reasoning` to start that way. If your model cannot disable reasoning, raise `--max-output-tokens` and `--request-timeout`. |
 | Context-length error | Reduce `--context-chars` and `--max-output-tokens`, or serve the model with a supported larger context length. |
 | Slow generation or GPU exhaustion | Keep `--llm-concurrency 1`; lower output/context sizes. Increase request/stall timeouts and the run duration for slow hardware. |
 | Search errors | Check the relevant key, network access, quota, and the error in `events.jsonl`. Semantic Scholar and Brave require separate provider credentials. |
 | Paper is a fallback | Inspect `summary.json` and `events.jsonl`: insufficient evidence, an exhausted time/token budget, invalid citations, or model errors can trigger a fallback. |
 
-Agen1 sends standard chat requests with `model`, `messages`, `temperature`, `max_tokens`, and `stream: false`. Native tool-call parsing flags in vLLM are not required by this client; its JSON action protocol is handled by Agen1.
+Agen1 sends standard streaming chat requests with `model`, `messages`, `temperature`, `max_tokens`, and `stream: true`, and falls back to non-streaming if the server rejects that. Native tool-call parsing flags in vLLM are not required by this client; its JSON action protocol is handled by Agen1.
 
 ## Verified before handoff
 

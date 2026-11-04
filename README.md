@@ -106,9 +106,10 @@ python3 -m agen1 run "How might a lid affect the cooling rate of a cup of water?
 
 1. **Planner:** splits the question into distinct assignments based on the selected duration and any saved evidence.
 2. **Researchers:** use Semantic Scholar, Brave, page retrieval, and optional PDF extraction. They share sources and source-linked notes. Each model decision produces one visible tool call.
-3. **Watchdog supervisor:** checks every five seconds. It cancels agents that make no evidence progress within `--stall-seconds`. Three identical calls, eight unproductive actions, four consecutive failures, step limits, and a shared token budget also stop unproductive work.
+3. **Watchdog supervisor:** checks every five seconds. It cancels agents that make no evidence progress within `--stall-seconds`. Three identical calls, eight unproductive actions, ten actions without a saved finding, four consecutive failures, step limits, and a shared token budget also stop unproductive work.
 4. **Supervisor reviewer:** every 30 seconds, a separate LLM role reviews each active worker's recent calls, outcomes, errors, and shared evidence. It can redirect an assignment (up to twice per worker) or stop it. The watchdog remains active if the reviewer fails.
-5. **Writer:** uses the evidence and notes to produce `paper.md`, including retrieved references. Unknown source-ID citations trigger an evidence-only fallback. This checks citation IDs, not whether every claim is scientifically supported.
+5. **Restarts:** if a worker fails, or a round ends with no findings, research restarts while time remains, up to `--max-restarts` times (default 5). The methods alternate: `agents-simplified` (fresh conversations, reasoning off, half the context) and `direct` (the engine chooses the searches itself, fetches pages, and asks the model about one source at a time). If the model is unavailable, `direct` saves relevant sentences labelled as verbatim excerpts, so evidence is still collected. A round also starts when agents finish cleanly but retrieved sources remain unread, so that `direct` can read them; pass `--max-restarts 0` to disable all of this. `summary.json` lists each round under `rounds`.
+6. **Writer:** uses the evidence and notes to produce `paper.md`, including retrieved references. Unknown source-ID citations trigger an evidence-only fallback. This checks citation IDs, not whether every claim is scientifically supported.
 
 `--hours` (or `--seconds`) sets a **maximum session duration**, not a promise to keep busy for that entire period. Writing reserves 20% of the duration, capped at five minutes. Research can finish early when assignments finish or limits are reached. If synthesis is unavailable, the program still saves an honest fallback report. File persistence and process cleanup can take a little additional time.
 
@@ -117,8 +118,12 @@ The default token budget is 250,000 per session, with 20% reserved for synthesis
 ## Recovery and persistence
 
 - Transient HTTP failures and rate limits receive up to three attempts, honoring numeric `Retry-After` values up to 60 seconds. Requests have hard timeouts and response size limits.
-- Invalid model JSON and tool failures are returned to the researcher with instructions to diagnose and change approach. This enables query reformulation, alternate sources, and—if enabled—local repairs using system tools.
-- Recovery is bounded. Missing credentials, unavailable models, invalid claims, or broken dependencies cannot always be repaired autonomously. These failures remain visible in the logs.
+- Cut-off or invalid JSON responses count as transient failures and are retried. Model replies are streamed, which keeps slow responses alive on networks that stall silent connections, and a draft cut off partway is kept and labelled rather than lost.
+- Model replies are parsed leniently: code fences, surrounding prose, arguments placed beside `"tool"`, and arrays of actions (up to five per reply) all work. Replies that are still unusable, and tool failures, are returned to the researcher so it can change approach.
+- An empty reply usually means a reasoning model used its whole output budget. The client retries with `chat_template_kwargs: {"enable_thinking": false}` and more output tokens, and keeps reasoning off for the rest of the session. `events.jsonl` records the `finish_reason`.
+- `search_papers` works without a Semantic Scholar key, at the shared public rate limit, and falls back to OpenAlex when Semantic Scholar is unavailable.
+- If the planner fails on resume, the run reuses the assignments saved in `plan.json`.
+- Recovery is bounded by the time budget, the token budget, and `--max-restarts`. Missing credentials, invalid claims, or broken dependencies cannot always be repaired autonomously. These failures remain visible in the logs.
 - Sources and notes are checkpointed after changes. Resume saved evidence with:
 
 ```bash
