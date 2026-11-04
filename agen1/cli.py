@@ -28,8 +28,17 @@ def parser():
     run.add_argument('--proposal', type=Path, action='append', default=[], help='Research proposal file; repeat for multiple proposals')
     run.add_argument('--material', type=Path, action='append', default=[], help='Supporting material file; repeat for multiple files')
     run.add_argument('--run-dir', type=Path, help='Persistent output directory; existing evidence is resumed')
-    run.add_argument('--base-url', default='http://127.0.0.1:11434/v1')
-    run.add_argument('--model', default='qwen2.5:14b')
+    run.add_argument(
+    '--base-url',
+    default=os.getenv('AGEN1_BASE_URL', 'http://127.0.0.1:11434/v1'),
+    help='LLM API base URL (defaults to AGEN1_BASE_URL environment variable)',
+    )
+
+    run.add_argument(
+    '--model',
+    default=os.getenv('AGEN1_MODEL', 'qwen2.5:14b'),
+    help='LLM model (defaults to AGEN1_MODEL environment variable)'
+    )
     run.add_argument('--workers', type=int, default=3)
     run.add_argument('--llm-concurrency', type=int, default=2)
     run.add_argument('--request-timeout', type=float, default=60)
@@ -51,8 +60,8 @@ def parser():
     status = commands.add_parser('status', help='Read saved progress and run summary')
     status.add_argument('run_dir', type=Path)
     doctor = commands.add_parser('doctor', help='Check configuration and local model connectivity')
-    doctor.add_argument('--base-url', default='http://127.0.0.1:11434/v1')
-    doctor.add_argument('--model', default='qwen2.5:14b')
+    doctor.add_argument('--base-url', default=os.getenv('AGEN1_BASE_URL', 'http://127.0.0.1:11434/v1'))
+    doctor.add_argument('--model', default=os.getenv('AGEN1_MODEL', 'qwen2.5:14b'))
     return p
 
 

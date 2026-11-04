@@ -6,4 +6,4 @@ runs/
 *.egg-info/
 build/
 dist/
-myresearch/title.txt
+myresearch/

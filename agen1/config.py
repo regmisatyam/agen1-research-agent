@@ -9,8 +9,17 @@ class Config:
     topic: str
     run_dir: Path
     hours: float = 1
-    base_url: str = "http://127.0.0.1:11434/v1"
-    model: str = "qwen2.5:14b"
+    base_url: str = field(
+    default_factory=lambda: os.getenv(
+        "AGEN1_BASE_URL", "http://127.0.0.1:11434/v1"
+    )
+    )
+
+    model: str = field(
+    default_factory=lambda: os.getenv(
+        "AGEN1_MODEL", "qwen2.5:14b"
+    )
+    )
     workers: int = 3
     llm_concurrency: int = 2
     request_timeout: float = 60
