@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agen1-research"
+version = "0.1.0"
+description = "Local-first autonomous multi-agent research runner"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+pdf = ["pypdf>=5,<7"]
+
+[project.scripts]
+agen1 = "agen1.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agen1*"]

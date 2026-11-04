@@ -1,0 +1,4 @@
+dataset_role,elapsed_minutes,open_cup_celsius,covered_cup_celsius
+synthetic_fixture_not_measured,0,80,80
+synthetic_fixture_not_measured,5,68,72
+synthetic_fixture_not_measured,10,59,65
