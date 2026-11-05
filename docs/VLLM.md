@@ -104,11 +104,11 @@ python -m agen1 run "Your research question" \
   --hours 4 --workers 3 --llm-concurrency 1 \
   --request-timeout 120 --stall-seconds 600 \
   --context-chars 16000 --max-output-tokens 2048 \
-  --max-tokens 500000 --max-steps 1000 \
+  --max-steps 1000 \
   --run-dir runs/my-research --verbose
 ```
 
-The context and output settings must fit your model's configured context window. `--context-chars` is a character budget for compact evidence/history, not an exact tokenizer limit; system prompts and assignments add overhead. Lower it and/or output tokens if vLLM reports a context-length error. Increase it for models with a larger context window when useful.
+Set `--context-limit` to the `max_model_len` vLLM serves (default 100000). Agen1 keeps every request, prompt and output together, under that limit and compacts older context to do so. `--context-chars` is a softer character budget for the evidence and history in each researcher request; increase it when researchers need more context per step, at the cost of slower steps. `--max-tokens` is separate: an optional total across the whole session, off by default.
 
 `Ctrl+C` asks the runner to stop work and write a final draft. To add documents later, stop the run first:
 
@@ -134,10 +134,11 @@ To authorize autonomous Bash commands with your OS user's permissions, add `--al
 | Chat-template error | Use an instruct/chat model with a working chat template configured in vLLM. Agen1 calls `/v1/chat/completions`. |
 | Invalid JSON decisions | Use a model that follows JSON instructions. The client consumes ordinary assistant `content` containing one JSON action; it does not consume native `tool_calls` or `reasoning_content`. Configure thinking/reasoning behavior appropriately for your model. |
 | `Model returned empty/non-text content` | A reasoning model probably used its whole output budget: check `reasoning_chars` and `finish_reason` in the `llm_retry` events. Agen1 retries with reasoning disabled through `chat_template_kwargs`, and also does so after a timeout. Pass `--no-reasoning` to start that way. If your model cannot disable reasoning, raise `--max-output-tokens` and `--request-timeout`. |
-| Context-length error | Reduce `--context-chars` and `--max-output-tokens`, or serve the model with a supported larger context length. |
+| Context-length error | Agen1 retries shorter and adopts the limit vLLM reports, without turning off streaming. If `compaction` events recur in `events.jsonl`, set `--context-limit` to the served `max_model_len`. |
+| Workers stop with `LLM token budget reached` | `--max-tokens` was set and 80% of it is spent. This is the session total, not the model's window. Raise it, or omit it to let the time budget decide. |
 | Slow generation or GPU exhaustion | Keep `--llm-concurrency 1`; lower output/context sizes. Increase request/stall timeouts and the run duration for slow hardware. |
 | Search errors | Check the relevant key, network access, quota, and the error in `events.jsonl`. Semantic Scholar and Brave require separate provider credentials. |
-| Paper is a fallback | Inspect `summary.json` and `events.jsonl`: insufficient evidence, an exhausted time/token budget, invalid citations, or model errors can trigger a fallback. |
+| Paper is a fallback | Inspect `summary.json` and `events.jsonl`: insufficient evidence, an exhausted time budget or `--max-tokens` cap, invalid citations, or model errors can trigger a fallback. |
 
 Agen1 sends standard streaming chat requests with `model`, `messages`, `temperature`, `max_tokens`, and `stream: true`, and falls back to non-streaming if the server rejects that. Native tool-call parsing flags in vLLM are not required by this client; its JSON action protocol is handled by Agen1.
 

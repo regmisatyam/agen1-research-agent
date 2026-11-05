@@ -14,9 +14,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def reject(self):
+        self.send_response(400)
+        self.end_headers()
+        self.wfile.write(b'maximum context length is 5000 tokens')
+
     def do_GET(self):
         if self.path == '/slow':
             time.sleep(1)
+        if self.path == '/reject':
+            return self.reject()
         if self.path == '/rate':
             self.send_response(429)
             self.send_header('Retry-After', '2')
@@ -32,6 +39,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if self.path == '/reject':
+            return self.reject()
         self.send_response(200)
         self.end_headers()
         self.wfile.write(json.dumps({'echo': payload}).encode())
@@ -69,6 +78,17 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             await HTTP(3).json(self.url + '/rate')
         self.assertTrue(ctx.exception.retryable)
         self.assertEqual(ctx.exception.retry_after, 2)
+
+    async def test_only_the_model_servers_error_text_is_kept(self):
+        with self.assertRaises(HTTPError) as posted:
+            await HTTP(3).json(self.url + '/reject', headers={'Content-Type': 'application/json'}, body={'messages': []})
+        self.assertIn('HTTP 400', str(posted.exception))
+        self.assertIn('maximum context length is 5000', str(posted.exception))
+        # Error pages from fetched sites are untrusted and must not reach a prompt.
+        with self.assertRaises(HTTPError) as fetched:
+            await HTTP(3).request(self.url + '/reject')
+        self.assertIn('HTTP 400', str(fetched.exception))
+        self.assertNotIn('maximum context length', str(fetched.exception))
 
     async def test_hard_timeout_and_size_limit(self):
         start = time.monotonic()

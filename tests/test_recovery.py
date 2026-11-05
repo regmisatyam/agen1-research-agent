@@ -16,7 +16,8 @@ from agen1 import http_worker
 from agen1.config import Config
 from agen1.engine import Engine, excerpt_note, key_terms
 from agen1.network import HTTP, HTTPError, LLM, extract_json, parse_actions, strip_reasoning
-from agen1.storage import Journal, Store
+from agen1.cli import parser
+from agen1.storage import Journal, Store, brief_result, shorten_notes
 from agen1.tools import Tools
 
 
@@ -773,6 +774,330 @@ class HelperTests(unittest.TestCase):
         quote = excerpt_note(PAGE, ['TOON', 'JSON', 'token'])
         self.assertIn('TOON improves token efficiency', quote)
         self.assertNotIn('footer', quote)
+
+
+class ContextLimitTests(Fixture):
+    """The model's window bounds one request; a session cap is separate and optional."""
+    def llm(self, serve):
+        http = Transport(None)
+        http.json = serve
+        return LLM(self.config, self.journal, http)
+
+    def test_cli_defaults_leave_the_time_budget_in_charge(self):
+        args = parser().parse_args(['run', 'topic'])
+        self.assertEqual(args.max_tokens, 0)
+        self.assertEqual(args.context_limit, 100000)
+
+    def test_validation(self):
+        Config('t', self.directory, max_tokens=0).validate()
+        with self.assertRaisesRegex(ValueError, 'max_tokens'):
+            Config('t', self.directory, max_tokens=-1).validate()
+        with self.assertRaisesRegex(ValueError, 'half of context_limit'):
+            Config('t', self.directory, context_limit=3000, max_output_tokens=2048).validate()
+
+    async def test_spending_past_the_old_default_does_not_stop_research(self):
+        script = iter(['{"tool":"fetch_page","args":{"url":"https://a.invalid/1"}}',
+                       '{"tool":"fetch_page","args":{"url":"https://a.invalid/2"}}',
+                       '{"tool":"finish","args":{"reason":"done"}}'])
+        def model(body):
+            system = body['messages'][0]['content']
+            if 'plan literature' in system:
+                text = '{"assignments":["a"]}'
+            elif 'rigorous literature' in system:
+                text = '# Paper'
+            else:
+                text = next(script)
+            return {**reply(text), 'usage': {'total_tokens': 200_000}}
+        self.config.max_restarts = 0
+        engine = self.build(Transport(model))
+        summary = await engine.run()
+        self.assertGreater(summary['tokens'], 250_000)
+        self.assertFalse(engine.budget_exhausted)
+        self.assertEqual(summary['workers']['researcher-1'], 'done')
+
+    async def test_oversized_request_is_cut_to_fit_without_touching_the_callers_messages(self):
+        self.config.context_limit = 4000
+        bodies = []
+        async def serve(url, **kw):
+            bodies.append(kw['body'])
+            return reply('ok')
+        llm = self.llm(serve)
+        original = [{'role': 'system', 'content': 'rules'}, {'role': 'user', 'content': 'x' * 100000}]
+        await llm.chat('a', original)
+        self.assertLessEqual(llm.prompt_tokens(bodies[0]['messages']) + bodies[0]['max_tokens'], 4000)
+        self.assertEqual(bodies[0]['max_tokens'], 100)
+        self.assertEqual(bodies[0]['messages'][0]['content'], 'rules')
+        self.assertIn('cut to fit', bodies[0]['messages'][1]['content'])
+        self.assertEqual(len(original[1]['content']), 100000)
+        self.assertEqual(llm.trims, 1)
+        self.assertEqual(len(self.events('compaction')), 1)
+
+    async def test_requests_within_the_window_are_left_alone(self):
+        bodies = []
+        async def serve(url, **kw):
+            bodies.append(kw['body'])
+            return reply('ok')
+        llm = self.llm(serve)
+        messages = [{'role': 'user', 'content': 'x' * 50000}]
+        await llm.chat('a', messages)
+        self.assertEqual(bodies[0]['messages'], messages)
+        self.assertEqual(llm.trims, 0)
+
+    async def test_retry_output_growth_stays_inside_the_window(self):
+        self.config.context_limit, self.config.max_output_tokens = 1000, 400
+        bodies = []
+        replies = [reply(None, 'length'), reply(None, 'length'), reply('ok')]
+        async def serve(url, **kw):
+            bodies.append(kw['body'])
+            return replies.pop(0)
+        llm = self.llm(serve)
+        await llm.chat('a', [{'role': 'user', 'content': 'x' * 6000}])
+        for body in bodies:
+            self.assertLessEqual(llm.prompt_tokens(body['messages']) + body['max_tokens'], 1000)
+        self.assertGreaterEqual(bodies[-1]['max_tokens'], 400)
+
+    async def test_server_overflow_shrinks_the_prompt_and_keeps_request_features(self):
+        """vLLM's real error is an HTTP 400, which used to switch off streaming for good."""
+        bodies = []
+        async def serve(url, **kw):
+            body = kw['body']
+            bodies.append(body)
+            # This server's tokens are denser than the client's estimate.
+            real = sum(len(m['content']) for m in body['messages']) // 2
+            if real + body['max_tokens'] > 5000:
+                raise HTTPError(f"HTTP 400 from model.invalid: This model's maximum context length is 5000 tokens. "
+                                f"However, you requested {real + body['max_tokens']} tokens ({real} in the messages, {body['max_tokens']} in the completion).")
+            return reply('ok')
+        self.config.no_reasoning = True
+        llm = self.llm(serve)
+        self.assertEqual(await llm.chat('a', [{'role': 'user', 'content': 'x' * 30000}]), 'ok')
+        self.assertEqual(len(bodies), 2)
+        self.assertLess(len(bodies[1]['messages'][0]['content']), 30000)
+        self.assertEqual(llm.context_limit, 5000)
+        self.assertTrue(llm.streaming)
+        self.assertTrue(llm.template_kwargs_supported)
+        self.assertTrue(bodies[1]['stream'])
+        self.assertIn('chat_template_kwargs', bodies[1])
+        # What the server taught us holds, so later requests fit the first time.
+        await llm.chat('a', [{'role': 'user', 'content': 'y' * 30000}])
+        self.assertEqual(len(bodies), 3)
+
+    async def test_overflow_that_never_clears_is_reported_without_side_effects(self):
+        bodies = []
+        async def serve(url, **kw):
+            bodies.append(kw['body'])
+            raise HTTPError('HTTP 400 from model.invalid: context length exceeded')
+        llm = self.llm(serve)
+        with self.assertRaisesRegex(HTTPError, 'context length'):
+            await llm.chat('a', [{'role': 'user', 'content': 'x' * 30000}])
+        self.assertEqual(len(bodies), 3)
+        sizes = [len(body['messages'][0]['content']) for body in bodies]
+        self.assertEqual(sizes, sorted(sizes, reverse=True))
+        self.assertLess(sizes[1], sizes[0])
+        self.assertLess(sizes[2], sizes[1])
+        self.assertTrue(llm.streaming)
+        self.assertTrue(llm.template_kwargs_supported)
+
+    async def test_overflow_learns_a_lower_window_for_later_requests(self):
+        bodies = []
+        async def serve(url, **kw):
+            bodies.append(kw['body'])
+            if sum(len(m['content']) for m in kw['body']['messages']) > 10000:
+                raise HTTPError('HTTP 400 from model.invalid: prompt is too long')
+            return reply('ok')
+        llm = self.llm(serve)
+        self.assertEqual(await llm.chat('a', [{'role': 'user', 'content': 'x' * 16000}]), 'ok')
+        self.assertLess(llm.context_limit, 100000)
+        seen = len(bodies)
+        await llm.chat('a', [{'role': 'user', 'content': 'y' * 16000}])
+        self.assertEqual(len(bodies), seen + 1, 'the next request should fit the first time')
+
+    def test_writer_room_respects_the_window_and_any_session_cap(self):
+        llm = self.llm(None)
+        self.assertEqual(llm.prompt_chars(final=True), int((95000 - 4096) * 3))
+        self.config.max_tokens = 50000
+        llm.tokens = 40000
+        self.assertEqual(llm.prompt_chars(final=True), (50000 - 40000 - 100) * 4)
+        llm.tokens = 60000
+        self.assertEqual(llm.prompt_chars(final=True), 0)
+
+
+class CompactionTests(Fixture):
+    def worker_model(self, script, prompts):
+        """Answers planner and writer, and plays `script` for the researcher."""
+        # A clean finish can start a recovery round; these tests watch the researcher alone.
+        self.config.max_restarts = 0
+        script = iter(script)
+        def model(body):
+            system = body['messages'][0]['content']
+            if 'plan literature' in system:
+                return reply('{"assignments":["a"]}')
+            if 'rigorous literature' in system:
+                prompts.append(('writer', body['messages']))
+                return reply('# Paper')
+            prompts.append(('worker', body['messages']))
+            return reply(next(script))
+        return model
+
+    async def test_compacted_worker_still_knows_what_it_already_did(self):
+        self.config.context_chars = 8000
+        prompts = []
+        script = [json.dumps({'tool': 'fetch_page', 'args': {'url': f'https://a.invalid/page-{i}'}}) for i in range(6)]
+        script.append('{"tool":"finish","args":{"reason":"done"}}')
+        http = Transport(self.worker_model(script, prompts))
+        http.request = AsyncMock(side_effect=lambda url, **kw: ('<p>' + url + ' ' + 'body text ' * 1000 + '</p>').encode())
+        engine = self.build(http)
+        summary = await engine.run()
+        self.assertGreater(summary['compacted_turns'], 0)
+        last = [messages for kind, messages in prompts if kind == 'worker'][-1]
+        turns = '\n'.join(m['content'] for m in last[2:])
+        self.assertNotIn('page-0', turns, 'the oldest result should have been evicted')
+        self.assertIn('fetch_page(https://a.invalid/page-0) -> S', last[1]['content'])
+        self.assertIn('Do not repeat', last[1]['content'])
+
+    async def test_failed_actions_are_logged_too(self):
+        prompts = []
+        script = ['{"tool":"read_source","args":{"source_id":"Smissing"}}', '{"tool":"finish","args":{"reason":"done"}}']
+        await self.build(Transport(self.worker_model(script, prompts))).run()
+        last = [messages for kind, messages in prompts if kind == 'worker'][-1]
+        self.assertIn('read_source(Smissing) -> failed: ValueError', last[1]['content'])
+
+    async def test_a_result_larger_than_the_history_budget_still_reaches_the_model(self):
+        """Halved recovery contexts used to evict a long page before anyone read it."""
+        self.config.context_chars = 8000
+        prompts = []
+        script = ['{"tool":"fetch_page","args":{"url":"https://a.invalid/long"}}', '{"tool":"finish","args":{"reason":"done"}}']
+        http = Transport(self.worker_model(script, prompts))
+        http.request = AsyncMock(return_value=('<p>START-OF-PAGE ' + 'long text ' * 1500 + '</p>').encode())
+        await self.build(http).run()
+        last = [messages for kind, messages in prompts if kind == 'worker'][-1]
+        self.assertIn('START-OF-PAGE', last[-1]['content'])
+        self.assertIn('read_source with an offset', last[-1]['content'])
+
+    async def test_duplicate_note_redirects_instead_of_demanding_another_note(self):
+        """Being told to note again right after a duplicate looped until the worker was stopped."""
+        sid, _ = self.store.source('Page', 'https://page.invalid', PAGE, 'brave', evidence_type='page_text')
+        note = json.dumps({'tool': 'note', 'args': {'text': 'A finding', 'citations': [sid]}})
+        fetch = lambda i: json.dumps({'tool': 'fetch_page', 'args': {'url': f'https://a.invalid/{i}'}})
+        prompts = []
+        script = [note, fetch(1), fetch(2), note, fetch(3), '{"tool":"finish","args":{"reason":"done"}}']
+        await self.build(Transport(self.worker_model(script, prompts))).run()
+        workers = [messages for kind, messages in prompts if kind == 'worker']
+        after_duplicate, after_fetch = workers[4][-1]['content'], workers[5][-1]['content']
+        self.assertIn('already saved', after_duplicate)
+        self.assertIn('Do not restate', after_duplicate)
+        self.assertNotIn('must be note', after_duplicate)
+        self.assertIn('must be note', after_fetch, 'other unproductive actions still get the nudge')
+        self.assertIn('duplicate, not saved', workers[4][1]['content'])
+        self.assertEqual(len(self.store.state['notes']), 1)
+
+    async def test_read_source_recovers_text_in_chunks(self):
+        tools = Tools(self.config, self.store, self.journal, Transport(None))
+        sid, _ = self.store.source('Paper', 'https://p.invalid', 'abcdefghij', 'web', evidence_type='page_text')
+        first = await tools.execute('a', 'read_source', {'source_id': sid, 'limit': 4})
+        self.assertEqual((first['text'], first['next_offset'], first['eof']), ('abcd', 4, False))
+        self.assertFalse(first['progress'])
+        second = await tools.execute('a', 'read_source', {'source_id': sid, 'offset': 4, 'limit': 100})
+        self.assertEqual((second['text'], second['eof']), ('efghij', True))
+        with self.assertRaisesRegex(ValueError, 'Unknown source'):
+            await tools.execute('a', 'read_source', {'source_id': 'Snope'})
+        with self.assertRaisesRegex(ValueError, 'limit'):
+            await tools.execute('a', 'read_source', {'source_id': sid, 'limit': 0})
+
+    def test_prompts_carry_only_the_metadata_a_model_uses(self):
+        source = {'id': 'S1', 'title': 'T', 'url': 'https://u.invalid', 'year': 2024, 'evidence_type': 'abstract', 'provider': 'semantic_scholar',
+                  'paper_id': 'long-paper-id', 'external_ids': {'DOI': 'd'}, 'pdf_url': 'https://u.invalid/p.pdf',
+                  'authors': ['A', 'B', 'C', 'D', 'E'], 'text': 'x' * 2000}
+        brief = brief_result({'results': [source], 'progress': True})
+        item = brief['results'][0]
+        self.assertTrue(brief['progress'])
+        self.assertEqual(item['id'], 'S1')
+        self.assertEqual(item['authors'], ['A', 'B', 'C'])
+        self.assertTrue(item['has_pdf'])
+        self.assertEqual((len(item['text']), item['text_chars']), (1200, 2000))
+        for dropped in ('provider', 'paper_id', 'external_ids', 'pdf_url'):
+            self.assertNotIn(dropped, item)
+        self.assertEqual(source['provider'], 'semantic_scholar', 'the stored record must stay whole')
+        page = {'source_id': 'S1', 'text': 'x' * 5000, 'progress': True}
+        self.assertEqual(brief_result(page), page)
+
+    def test_worker_evidence_is_bounded_and_keeps_the_newest_sources(self):
+        for i in range(60):
+            self.store.source(f'Paper {i}', f'https://p.invalid/{i}', 'abstract ' * 200, 'web', evidence_type='abstract')
+        evidence = self.store.evidence(5000, excerpt=300)
+        self.assertLessEqual(len(json.dumps(evidence)), 5000)
+        titles = [source['title'] for source in evidence['sources']]
+        self.assertEqual(titles[-1], 'Paper 59')
+        self.assertNotIn('Paper 0', titles)
+        self.assertEqual(evidence['sources_omitted'], 60 - len(titles))
+        self.assertLessEqual(max(len(source['text']) for source in evidence['sources']), 300)
+
+    def add_notes(self, count, length):
+        sid, _ = self.store.source('Page', 'https://page.invalid', PAGE, 'brave', evidence_type='page_text')
+        for i in range(count):
+            self.store.note(f'Finding {i:03d} ' + 'detail ' * (length // 7), [sid], 'agent')
+        return sid
+
+    async def test_writer_sees_notes_far_beyond_context_chars(self):
+        sid = self.add_notes(300, 300)
+        prompts = []
+        engine = self.build(Transport(lambda body: (prompts.append(body['messages'][1]['content']), reply(f'# Paper [{sid}]'))[1]))
+        self.assertTrue(await engine.synthesize())
+        self.assertGreater(len(prompts[0]), self.config.context_chars)
+        for i in (0, 150, 299):
+            self.assertIn(f'Finding {i:03d}', prompts[0])
+        self.assertIn('"notes_omitted": 0', prompts[0])
+        self.assertNotIn('[shortened]', prompts[0])
+        self.assertFalse(self.events('compaction'))
+        self.assertLess(engine.llm.prompt_tokens([{'content': prompts[0]}]), self.config.context_limit)
+
+    async def test_notes_beyond_the_window_are_shortened_not_dropped(self):
+        self.config.context_limit = 10000
+        sid = self.add_notes(50, 1000)
+        before = json.loads(json.dumps(self.store.state['notes']))
+        bodies = []
+        engine = self.build(Transport(lambda body: (bodies.append(body), reply(f'# Paper [{sid}]'))[1]))
+        self.assertTrue(await engine.synthesize())
+        prompt = bodies[0]['messages'][1]['content']
+        for i in range(50):
+            self.assertIn(f'Finding {i:03d}', prompt)
+        self.assertIn('[shortened]', prompt)
+        self.assertIn('"notes_omitted": 0', prompt)
+        self.assertLessEqual(engine.llm.prompt_tokens(bodies[0]['messages']) + bodies[0]['max_tokens'], 10000)
+        self.assertEqual(engine.llm.trims, 0, 'evidence should already fit before the last-resort cut')
+        self.assertIn('50 notes shortened', self.events('compaction')[0]['summary'])
+        self.assertEqual(self.store.state['notes'], before, 'saved notes must stay whole')
+
+    def test_shortening_only_touches_notes_that_are_too_long(self):
+        notes = [{'text': 'short', 'citations': []}, {'text': 'x' * 5000, 'citations': []}, {'text': 'y' * 3000, 'citations': []}]
+        shortened = shorten_notes(notes, 3000)
+        self.assertEqual(shortened[0]['text'], 'short')
+        removed = sum(len(a['text']) - len(b['text']) for a, b in zip(notes, shortened))
+        self.assertGreaterEqual(removed, 3000)
+        self.assertLess(removed, 3100, 'should not remove much more than needed')
+        self.assertEqual(len(notes[1]['text']), 5000)
+
+    async def test_oldest_notes_go_only_when_shortening_cannot_fit_them(self):
+        self.config.context_limit = 10000
+        sid = self.add_notes(300, 500)
+        bodies = []
+        engine = self.build(Transport(lambda body: (bodies.append(body), reply(f'# Paper [{sid}]'))[1]))
+        await engine.synthesize()
+        prompt = bodies[0]['messages'][1]['content']
+        self.assertIn('Finding 299', prompt)
+        self.assertNotIn('Finding 000', prompt)
+        self.assertRegex(prompt, r'"notes_omitted": [1-9]')
+
+    async def test_summary_reports_how_close_the_run_came_to_the_window(self):
+        def model(body):
+            system = body['messages'][0]['content']
+            text = '{"assignments":["a"]}' if 'plan literature' in system else '{"tool":"finish","args":{"reason":"done"}}'
+            return {**reply(text), 'usage': {'total_tokens': 900, 'prompt_tokens': 800}}
+        summary = await self.build(Transport(model)).run()
+        self.assertEqual(summary['context_limit'], 100000)
+        self.assertEqual(summary['peak_prompt_tokens'], 800)
+        self.assertEqual(summary['trimmed_requests'], 0)
+        self.assertIn('compacted_turns', summary)
 
 
 if __name__ == '__main__':

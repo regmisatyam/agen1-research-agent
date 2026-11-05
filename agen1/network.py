@@ -52,12 +52,26 @@ class HTTP:
             raise HTTPError(f"Invalid JSON from {urlsplit(url).hostname}: {e}", True) from e
 
 
+# Servers word this differently; vLLM says "maximum context length is N tokens".
+OVERFLOW = re.compile(r"context.{0,20}(length|size|window)|max_model_len|reduce the length|too many tokens|prompt is too long", re.I)
+REPORTED_LIMIT = re.compile(r"maximum context length is (\d+)", re.I)
+REPORTED_PROMPT = re.compile(r"(\d+)(?: in the messages| input tokens)", re.I)
+# Stay a little under the window: token counts here are estimates.
+WINDOW_USE = .95
+CUT_MARK = "\n...[cut to fit the model's context limit]"
+
+
 class LLM:
     def __init__(self, config, journal, http):
         self.config, self.journal, self.http = config, journal, http
         self.gate = asyncio.Semaphore(config.llm_concurrency)
         self.tokens = 0
         self.reserved = 0
+        self.context_limit = config.context_limit
+        # Cautious, because JSON, URLs, and IDs tokenize worse than prose.
+        self.chars_per_token = 3.0
+        self.peak_prompt_tokens = 0
+        self.trims = 0
         # Reasoning models can spend the whole output budget before answering.
         # Once seen, ask the server to skip reasoning for the rest of the session.
         self.disable_thinking = config.no_reasoning
@@ -66,12 +80,65 @@ class LLM:
         # responses after a few seconds, and it preserves partial text.
         self.streaming = True
 
+    def prompt_tokens(self, messages):
+        return int(sum(len(m["content"]) for m in messages) / self.chars_per_token) + 4 * len(messages)
+
+    def output_budget(self, final):
+        # A paper needs more room than a single tool decision.
+        wanted = max(self.config.max_output_tokens, 4096) if final else self.config.max_output_tokens
+        return min(wanted, self.context_limit // 2)
+
+    def session_ceiling(self, final):
+        # Keep the last 20% of a session cap for synthesis.
+        return self.config.max_tokens if final else int(self.config.max_tokens * .8)
+
+    def prompt_chars(self, final=False):
+        """Prompt characters one request can carry within the window and any session cap."""
+        chars = (int(self.context_limit * WINDOW_USE) - self.output_budget(final)) * self.chars_per_token
+        if self.config.max_tokens:
+            left = self.session_ceiling(final) - self.tokens - self.reserved - self.config.max_output_tokens
+            chars = min(chars, left * 4)
+        return max(0, int(chars))
+
+    def fit(self, agent, messages, output_tokens):
+        """Last line of defense: cut the longest messages so the request fits the window."""
+        excess = self.prompt_tokens(messages) + output_tokens - int(self.context_limit * WINDOW_USE)
+        if excess <= 0:
+            return messages
+        fitted = [dict(m) for m in messages]
+        cut = int(excess * self.chars_per_token) + 1
+        before = cut
+        while cut > 0:
+            longest = max((m for m in fitted if m["role"] != "system"), key=lambda m: len(m["content"]), default=None)
+            # Keep enough of every message for it to still make sense.
+            removable = len(longest["content"]) - 200 if longest else 0
+            if removable <= 0:
+                break
+            taken = min(cut, removable)
+            longest["content"] = longest["content"][:-(taken + len(CUT_MARK))] + CUT_MARK
+            cut -= taken
+        self.trims += 1
+        self.journal.event(agent, "compaction", f"Cut {before - cut} prompt characters to fit the {self.context_limit}-token window")
+        return fitted
+
+    def tighten(self, error, messages, output_tokens):
+        """The server measured this prompt; trust that over the estimate from now on."""
+        text = str(error)
+        if limit := REPORTED_LIMIT.search(text):
+            self.context_limit = min(self.context_limit, int(limit[1]))
+        if measured := REPORTED_PROMPT.search(text):
+            ratio = sum(len(m["content"]) for m in messages) / max(1, int(measured[1]))
+            self.chars_per_token = max(1, min(self.chars_per_token, ratio))
+        else:
+            # The size is unknown, so assume this request has to shrink by a quarter.
+            shrunk = int((self.prompt_tokens(messages) + output_tokens) * .75)
+            self.context_limit = max(1000, min(self.context_limit, shrunk))
+
     async def chat(self, agent, messages, *, final=False):
         async with self.gate:
+            messages = self.fit(agent, messages, self.output_budget(final))
             estimate = sum(len(m["content"]) for m in messages) // 4 + self.config.max_output_tokens
-            # Keep the last 20% of the token budget for synthesis.
-            ceiling = self.config.max_tokens if final else int(self.config.max_tokens * .8)
-            if self.tokens + self.reserved + estimate > ceiling:
+            if self.config.max_tokens and self.tokens + self.reserved + estimate > self.session_ceiling(final):
                 raise RuntimeError("LLM token budget exhausted; end research and synthesize")
             self.reserved += estimate
             try:
@@ -81,13 +148,14 @@ class LLM:
                 self.reserved -= estimate
 
     async def generate(self, agent, messages, final):
-        # A paper needs more room than a single tool decision.
-        output_tokens = max(self.config.max_output_tokens, 4096) if final else self.config.max_output_tokens
+        base_output = output_tokens = self.output_budget(final)
         diagnosis = "no response"
         partial = ""
         for attempt in range(3):
+            # Retries raise the output budget, which must not push past the window.
+            room = int(self.context_limit * WINDOW_USE) - self.prompt_tokens(messages)
             body = {"model": self.config.model, "messages": messages, "temperature": .2,
-                    "max_tokens": output_tokens, "stream": self.streaming}
+                    "max_tokens": max(1, min(output_tokens, room)), "stream": self.streaming}
             if self.streaming:
                 body["stream_options"] = {"include_usage": True}
             if self.disable_thinking and self.template_kwargs_supported:
@@ -98,11 +166,20 @@ class LLM:
                     body=body)
             except HTTPError as e:
                 self.journal.event(agent, "retry", str(e), attempt=attempt + 1)
+                # An overlong prompt is also an HTTP 400, and removing request features
+                # would not cure it, so check for it before dropping any of them.
+                overflow = OVERFLOW.search(str(e))
+                if overflow and attempt < 2:
+                    self.tighten(e, messages, base_output)
+                    # A smaller window can also shrink what is left for the reply.
+                    base_output = output_tokens = min(output_tokens, self.output_budget(final))
+                    messages = self.fit(agent, messages, base_output)
+                    continue
                 # Drop optional request features one at a time if the server rejects them.
-                if "HTTP 400" in str(e) and "chat_template_kwargs" in body:
+                if not overflow and "HTTP 400" in str(e) and "chat_template_kwargs" in body:
                     self.template_kwargs_supported = False
                     continue
-                if "HTTP 400" in str(e) and self.streaming:
+                if not overflow and "HTTP 400" in str(e) and self.streaming:
                     self.streaming = False
                     continue
                 # Reasoning can outlast the request timeout, so retry without it.
@@ -120,6 +197,8 @@ class LLM:
             usage = (data.get("usage") or {}).get("total_tokens")
             # Rejected replies still consumed server tokens, so count them too.
             self.tokens += int(usage) if isinstance(usage, (int, float)) and usage > 0 else sum(len(m["content"]) for m in messages) // 4 + len(content) // 4
+            prompt_used = (data.get("usage") or {}).get("prompt_tokens")
+            self.peak_prompt_tokens = max(self.peak_prompt_tokens, int(prompt_used) if isinstance(prompt_used, (int, float)) and prompt_used > 0 else self.prompt_tokens(messages))
             if content and finish_reason == "interrupted" and attempt < 2:
                 partial = max(partial, content, key=len)
                 self.journal.event(agent, "retry", f"Reply was cut off after {len(content)} characters", attempt=attempt + 1)

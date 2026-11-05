@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
+import os
 from urllib.parse import urlsplit
 import math
 
@@ -24,7 +25,10 @@ class Config:
     llm_concurrency: int = 2
     request_timeout: float = 60
     max_steps: int = 500
-    max_tokens: int = 250_000
+    # Tokens across the whole session; 0 leaves the time budget in charge.
+    max_tokens: int = 0
+    # The model's window for one request, prompt and output together.
+    context_limit: int = 100_000
     max_output_tokens: int = 2048
     context_chars: int = 40_000
     supervisor_interval: float = 5
@@ -45,9 +49,13 @@ class Config:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        for name in ("workers", "llm_concurrency", "max_steps", "max_tokens", "max_output_tokens"):
+        for name in ("workers", "llm_concurrency", "max_steps", "context_limit", "max_output_tokens"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
+        if self.max_tokens < 0:
+            raise ValueError("max_tokens must not be negative; 0 means no session cap")
+        if self.max_output_tokens * 2 > self.context_limit:
+            raise ValueError("max_output_tokens must be at most half of context_limit")
         if self.max_restarts < 0:
             raise ValueError("max_restarts must not be negative")
         if self.context_chars < 8000:

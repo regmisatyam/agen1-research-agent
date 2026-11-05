@@ -19,6 +19,12 @@ QUESTION = 'Why does ice float in liquid water?'
 
 class ScenarioLLM:
     tokens = 0
+    context_limit = 100_000
+    peak_prompt_tokens = 0
+    trims = 0
+
+    def prompt_chars(self, final=False):
+        return 300_000
 
     def __init__(self, source_id, worker_delay=0, writer_delay=0):
         self.source_id = source_id

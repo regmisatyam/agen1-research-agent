@@ -55,7 +55,7 @@ python3 -m agen1 doctor --base-url http://127.0.0.1:11434/v1 --model qwen2.5:14b
 python3 -m agen1 run "Compare recent methods for evaluating factuality in RAG" \
   --hours 4 --workers 3 --llm-concurrency 2 \
   --base-url http://127.0.0.1:11434/v1 --model qwen2.5:14b \
-  --max-tokens 500000 --max-steps 1000 --run-dir runs/rag-review --verbose
+  --max-steps 1000 --run-dir runs/rag-review --verbose
 ```
 
 For LM Studio, use its configured model ID and a base URL such as `http://127.0.0.1:1234/v1`. If your GPU/server only handles one generation at once, set `--llm-concurrency 1`. Researchers still run concurrently while requests queue. Increase `--request-timeout` and `--stall-seconds` for slow models; the stall window should cover request queueing and generation time.
@@ -106,14 +106,25 @@ python3 -m agen1 run "How might a lid affect the cooling rate of a cup of water?
 
 1. **Planner:** splits the question into distinct assignments based on the selected duration and any saved evidence.
 2. **Researchers:** use Semantic Scholar, Brave, page retrieval, and optional PDF extraction. They share sources and source-linked notes. Each model decision produces one visible tool call.
-3. **Watchdog supervisor:** checks every five seconds. It cancels agents that make no evidence progress within `--stall-seconds`. Three identical calls, eight unproductive actions, ten actions without a saved finding, four consecutive failures, step limits, and a shared token budget also stop unproductive work.
+3. **Watchdog supervisor:** checks every five seconds. It cancels agents that make no evidence progress within `--stall-seconds`. Three identical calls, eight unproductive actions, ten actions without a saved finding, four consecutive failures, step limits, and an optional session token cap also stop unproductive work.
 4. **Supervisor reviewer:** every 30 seconds, a separate LLM role reviews each active worker's recent calls, outcomes, errors, and shared evidence. It can redirect an assignment (up to twice per worker) or stop it. The watchdog remains active if the reviewer fails.
 5. **Restarts:** if a worker fails, or a round ends with no findings, research restarts while time remains, up to `--max-restarts` times (default 5). The methods alternate: `agents-simplified` (fresh conversations, reasoning off, half the context) and `direct` (the engine chooses the searches itself, fetches pages, and asks the model about one source at a time). If the model is unavailable, `direct` saves relevant sentences labelled as verbatim excerpts, so evidence is still collected. A round also starts when agents finish cleanly but retrieved sources remain unread, so that `direct` can read them; pass `--max-restarts 0` to disable all of this. `summary.json` lists each round under `rounds`.
 6. **Writer:** uses the evidence and notes to produce `paper.md`, including retrieved references. Unknown source-ID citations trigger an evidence-only fallback. This checks citation IDs, not whether every claim is scientifically supported.
 
 `--hours` (or `--seconds`) sets a **maximum session duration**, not a promise to keep busy for that entire period. Writing reserves 20% of the duration, capped at five minutes. Research can finish early when assignments finish or limits are reached. If synthesis is unavailable, the program still saves an honest fallback report. File persistence and process cleanup can take a little additional time.
 
-The default token budget is 250,000 per session, with 20% reserved for synthesis. Usage comes from the server when supplied; otherwise it is estimated from text length. Per-request input is bounded with recent history and compact shared evidence, so long runs do not grow the model context indefinitely. Tune the budgets to your hardware and research duration.
+Two token limits are easy to confuse:
+
+- `--context-limit` (default 100,000) is the model's window for **one request**, prompt and output together. Set it to your model's real limit, for example vLLM's `max_model_len`. Requests are kept under it, so a long run cannot outgrow the model.
+- `--max-tokens` (default 0, no cap) is an optional total across **all requests in the session**. A cap stops research when 80% of it is spent and keeps the rest for synthesis. Usage comes from the server when supplied; otherwise it is estimated from text length. Set a cap on a metered endpoint; otherwise the time budget decides when the run ends.
+
+Long runs stay inside the window by compacting:
+
+- **Researchers** keep recent turns verbatim, within a third of `--context-chars`. Older turns are evicted, and a one-line-per-action log tells the researcher what it already searched, read, and saved. The `read_source` tool re-reads any retrieved source from disk. The newest result is always kept, cut to fit if necessary, so nothing is evicted unread.
+- **The writer** gets every note, using as much of the window as it needs. Past that, the longest notes are shortened and marked `[shortened]`; the oldest are dropped only if shortening is not enough. The paper is told to state this under limitations, and `state.json` keeps the full notes.
+- **If the server still reports a context-length error**, the request is retried shorter, and any limit the server reports replaces `--context-limit` for the rest of the session.
+
+`summary.json` records `peak_prompt_tokens`, `context_limit`, `compacted_turns`, and `trimmed_requests`, and heartbeats show the largest prompt so far.
 
 ## Recovery and persistence
 
@@ -123,7 +134,7 @@ The default token budget is 250,000 per session, with 20% reserved for synthesis
 - An empty reply usually means a reasoning model used its whole output budget. The client retries with `chat_template_kwargs: {"enable_thinking": false}` and more output tokens, and keeps reasoning off for the rest of the session. `events.jsonl` records the `finish_reason`.
 - `search_papers` works without a Semantic Scholar key, at the shared public rate limit, and falls back to OpenAlex when Semantic Scholar is unavailable.
 - If the planner fails on resume, the run reuses the assignments saved in `plan.json`.
-- Recovery is bounded by the time budget, the token budget, and `--max-restarts`. Missing credentials, invalid claims, or broken dependencies cannot always be repaired autonomously. These failures remain visible in the logs.
+- Recovery is bounded by the time budget, any `--max-tokens` cap, and `--max-restarts`. Missing credentials, invalid claims, or broken dependencies cannot always be repaired autonomously. These failures remain visible in the logs.
 - Sources and notes are checkpointed after changes. Resume saved evidence with:
 
 ```bash

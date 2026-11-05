@@ -71,7 +71,15 @@ def main():
             retry_after = min(60, max(0, float(e.headers.get('Retry-After', '0'))))
         except ValueError:
             retry_after = 0
-        result = {'error': f'HTTP {e.code} from {urlsplit(url).hostname}', 'retryable': e.code == 429 or e.code >= 500, 'retry_after': retry_after}
+        detail = ''
+        # Only the model server receives POSTs, and its error text says why it refused
+        # a request. Error bodies from fetched web pages stay out of the prompts.
+        if params['body'] is not None and 400 <= e.code < 500:
+            try:
+                detail = ': ' + e.read(2000).decode('utf-8', 'replace')
+            except (http.client.HTTPException, OSError):
+                pass
+        result = {'error': f'HTTP {e.code} from {urlsplit(url).hostname}{detail}', 'retryable': e.code == 429 or e.code >= 500, 'retry_after': retry_after}
     except OverflowError:
         result = {'error': 'HTTP response exceeds configured size limit', 'retryable': False}
     except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, ValueError) as e:

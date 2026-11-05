@@ -14,6 +14,46 @@ def atomic_json(path, data):
     temp.replace(path)
 
 
+def brief_source(source, excerpt=1200):
+    """What a model needs from a source; the store keeps everything else."""
+    brief = {k: source[k] for k in ("id", "title", "url", "year", "evidence_type") if source.get(k)}
+    if source.get("authors"):
+        brief["authors"] = source["authors"][:3]
+    if source.get("pdf_url"):
+        brief["has_pdf"] = True
+    text = source.get("text", "")
+    brief["text"] = text[:excerpt]
+    if len(text) > excerpt:
+        brief["text_chars"] = len(text)
+    return brief
+
+
+def brief_result(result):
+    """Search hits repeat each source's full stored record, which prompts do not need."""
+    if isinstance(result.get("results"), list):
+        return {**result, "results": [brief_source(source) for source in result["results"]]}
+    return result
+
+
+NOTE_FLOOR = 160
+SHORTENED_MARK = " ...[shortened]"
+
+
+def shorten_notes(notes, excess):
+    """Trim the longest notes first, so that every finding still reaches the writer."""
+    lengths = [len(note["text"]) for note in notes]
+    low, high = NOTE_FLOOR, max(lengths, default=NOTE_FLOOR)
+    # The longest per-note length that removes enough characters overall.
+    while low < high:
+        middle = (low + high + 1) // 2
+        if sum(max(0, length - middle) for length in lengths) >= excess:
+            low = middle
+        else:
+            high = middle - 1
+    return [{**note, "text": note["text"][:low - len(SHORTENED_MARK)] + SHORTENED_MARK} if len(note["text"]) > low else note
+            for note in notes]
+
+
 class Journal:
     def __init__(self, directory, verbose=False, quiet=False):
         self.directory = Path(directory)
@@ -112,8 +152,11 @@ class Store:
         self.state.setdefault("read_sources", []).append(source_id)
         self.save()
 
-    def evidence(self, limit=24000, max_notes=20):
-        """Bounded context with space reserved for supplied proposal/reference excerpts."""
+    def evidence(self, limit=24000, max_notes=20, excerpt=1200, notes_limit=None):
+        """Bounded context with space reserved for supplied proposal/reference excerpts.
+
+        Older sources give way first. With `notes_limit`, notes may outgrow `limit` up to
+        that size and are shortened rather than dropped, because the writer needs them all."""
         all_sources = list(self.state["sources"].values())
         materials = sorted((s for s in all_sources if s.get("provider") == "user"),
                            key=lambda s: s.get("material_role") != "proposal")
@@ -126,12 +169,33 @@ class Store:
                 break
             compact.append(item)
         notes = self.state["notes"] if max_notes is None else self.state["notes"][-max_notes:]
-        result = {"notes": notes, "materials": compact,
+        result = {"notes": list(notes), "notes_total": len(self.state["notes"]), "materials": compact,
                   "materials_total": len(materials), "materials_omitted": len(materials) - len(compact),
-                  "sources": [{k: v for k, v in s.items() if k != "text"} | {"text": s["text"][:1200]}
-                              for s in all_sources if s.get("provider") != "user"]}
-        while len(json.dumps(result)) > limit and result["sources"]:
-            result["sources"].pop()
-        while len(json.dumps(result)) > limit and result["notes"]:
+                  "sources": [], "sources_omitted": 0}
+        ceiling = limit if notes_limit is None else max(limit, notes_limit)
+        size = len(json.dumps(result))
+        if size > ceiling and notes_limit is not None:
+            result["notes"] = shorten_notes(result["notes"], size - ceiling)
+            result["notes_shortened"] = sum(a["text"] != b["text"] for a, b in zip(result["notes"], notes))
+        while len(json.dumps(result)) > ceiling and result["notes"]:
             result["notes"].pop(0)
+        result["notes_omitted"] = len(notes) - len(result["notes"])
+        retrieved = [s for s in all_sources if s.get("provider") != "user"]
+        # Leave room for sources_omitted to grow past one digit.
+        room = limit - len(json.dumps(result)) - 8
+        if notes_limit is not None:
+            # Notes alone may fill `limit`, but the writer still needs to know what its
+            # citations are, so cited sources come first and always get some room.
+            cited = {sid for note in result["notes"] for sid in note["citations"]}
+            retrieved.sort(key=lambda s: s["id"] in cited)
+            room = max(room, min(limit // 2, ceiling - len(json.dumps(result))))
+        kept = []
+        for source in reversed(retrieved):
+            brief = brief_source(source, excerpt)
+            room -= len(json.dumps(brief)) + 2
+            if room < 0:
+                break
+            kept.append(brief)
+        result["sources"] = kept[::-1]
+        result["sources_omitted"] = len(retrieved) - len(kept)
         return result
