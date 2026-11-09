@@ -145,18 +145,71 @@ class Tools:
             progress |= new
         return {"results": found, "progress": progress}
 
+
     async def search_openalex(self, query):
-        data = await self.http.json("https://api.openalex.org/works?" + urlencode({"search": query, "per-page": 5}))
+        import os
+        from urllib.parse import urlencode
+
+        api_key = os.getenv("OPENALEX_API_KEY")
+
+        if not api_key:
+            raise RuntimeError(
+                "OPENALEX_API_KEY is missing. "
+                "Export OPENALEX_API_KEY before starting research."
+            )
+
+        params = {
+            "search": query,
+            "per-page": 5,
+            "api_key": api_key,
+        }
+
+        url = "https://api.openalex.org/works?" + urlencode(params)
+
+        data = await self.http.json(url)
+
         found, progress = [], False
+
         for work in data.get("results", []):
             # OpenAlex stores abstracts as {word: [positions]}.
-            words = sorted((position, word) for word, positions in (work.get("abstract_inverted_index") or {}).items() for position in positions)
-            sid, new = self.store.source(work.get("title") or "Untitled", work.get("doi") or work.get("id") or "", " ".join(word for _, word in words) or "Abstract unavailable", "openalex",
-                paper_id=work.get("id"), year=work.get("publication_year"), authors=[a.get("author", {}).get("display_name", "") for a in work.get("authorships", [])[:20]],
-                pdf_url=(work.get("best_oa_location") or {}).get("pdf_url"), external_ids=work.get("ids", {}), evidence_type="abstract")
+            words = sorted(
+                (position, word)
+                for word, positions in (
+                    work.get("abstract_inverted_index") or {}
+                ).items()
+                for position in positions
+            )
+
+            abstract = " ".join(word for _, word in words)
+            if not abstract:
+                abstract = "Abstract unavailable"
+
+            sid, new = self.store.source(
+                work.get("title") or "Untitled",
+                work.get("doi") or work.get("id") or "",
+                abstract,
+                "openalex",
+                paper_id=work.get("id"),
+                year=work.get("publication_year"),
+                authors=[
+                    a.get("author", {}).get("display_name", "")
+                    for a in work.get("authorships", [])[:20]
+                ],
+                pdf_url=(
+                    work.get("best_oa_location") or {}
+                ).get("pdf_url"),
+                external_ids=work.get("ids", {}),
+                evidence_type="abstract",
+            )
+
             found.append(self.store.state["sources"][sid])
             progress |= new
-        return {"results": found, "progress": progress}
+
+        return {
+            "results": found,
+            "progress": progress
+        }
+
 
     async def search_web(self, query):
         key = os.getenv("BRAVE_SEARCH_API_KEY")
